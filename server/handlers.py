@@ -2,12 +2,14 @@ import logging
 from aiohttp import web
 import aiohttp
 import aiohttp_jinja2
-from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
-channels = defaultdict(list)
-channel_consumers = defaultdict(set)
+channel_consumers: dict[str, set[web.WebSocketResponse]] = {}
+channel_producers: dict[str, set[web.WebSocketResponse]] = {}
+
+def get_active_channels():
+    return set(channel_consumers.keys()) | set(channel_producers.keys())
 
 @aiohttp_jinja2.template('index.html')
 async def index(request):
@@ -20,40 +22,66 @@ async def consume(request):
     ip = request.remote
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+
+    if channel_id not in channel_consumers:
+        channel_consumers[channel_id] = set()
     channel_consumers[channel_id].add(ws)
+    logger.info(f"Consumer connected to channel {channel_id} from {ip}")
+
     try:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.ERROR:
-                logger.error(f'WebSocket connection closed with exception {ws.exception()} from {ip}')
+                logger.error(f'WebSocket error from consumer {ip}: {ws.exception()}')
     finally:
-        channel_consumers[channel_id].remove(ws)
+        if channel_id in channel_consumers:
+            channel_consumers[channel_id].discard(ws)
+            if not channel_consumers[channel_id]:
+                del channel_consumers[channel_id]
         logger.info(f"Consumer disconnected from channel {channel_id} from {ip}")
     return ws
 
 async def produce(request):
     channel_id = request.match_info['channel_id']
     ip = request.remote
-    logger.info(f"New producer connected to channel {channel_id} from {ip}")
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+
+    if channel_id not in channel_producers:
+        channel_producers[channel_id] = set()
+    channel_producers[channel_id].add(ws)
+    logger.info(f"Producer connected to channel {channel_id} from {ip}")
+
     try:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.BINARY:
-                channels[channel_id].append(msg.data)
-                for consumer in channel_consumers[channel_id]:
-                    await consumer.send_bytes(msg.data)
+                consumers = list(channel_consumers.get(channel_id, set()))
+                dead_consumers = []
+                for consumer in consumers:
+                    if consumer.closed:
+                        dead_consumers.append(consumer)
+                        continue
+                    try:
+                        await consumer.send_bytes(msg.data)
+                    except ConnectionResetError:
+                        dead_consumers.append(consumer)
+                for dead in dead_consumers:
+                    channel_consumers.get(channel_id, set()).discard(dead)
             elif msg.type == aiohttp.WSMsgType.ERROR:
-                logger.error(f'WebSocket connection closed with exception {ws.exception()} from {ip}')
+                logger.error(f'WebSocket error from producer {ip}: {ws.exception()}')
     finally:
+        if channel_id in channel_producers:
+            channel_producers[channel_id].discard(ws)
+            if not channel_producers[channel_id]:
+                del channel_producers[channel_id]
         logger.info(f"Producer disconnected from channel {channel_id} from {ip}")
     return ws
 
-
 async def list_channels(request):
-    return web.json_response({'channels': list(channels.keys())})
+    return web.json_response({'channels': list(get_active_channels())})
 
 async def metrics(request):
     return web.json_response({
-        'active_channels': len(channels),
-        'active_consumers': sum(len(consumers) for consumers in channel_consumers.values())
+        'active_channels': len(get_active_channels()),
+        'total_consumers': sum(len(c) for c in channel_consumers.values()),
+        'total_producers': sum(len(p) for p in channel_producers.values())
     })
